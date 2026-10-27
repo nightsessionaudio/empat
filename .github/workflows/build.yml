@@ -2,7 +2,7 @@ name: Build
 on: [push, workflow_dispatch]
 jobs:
   mac:
-    runs-on: macos-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - run: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
