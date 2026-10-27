@@ -10,11 +10,12 @@ namespace lava {
 constexpr int W = 176, H = 80;
 constexpr float AS = 2.2f; // W / H
 
+// Палитра Smoke LCD (как в HTML-референсе).
 // Ethereal (верх-лево), Toxic (верх-право), Candlelight (низ-лево), 4 AM (низ-право), центр
 static const unsigned PAL[5][3] = {
-  { 0x9db2ff, 0xcaa6ff, 0xe4f0ff }, { 0xb7ff3a, 0x5af0a0, 0xeaff7a },
-  { 0xff8a2b, 0xffc45c, 0xff5f3a }, { 0x3050e0, 0x6c3fd6, 0x2aa0e8 },
-  { 0xffd9c6, 0xff9fb4, 0xfff3e8 } };
+  { 0x8fa3dc, 0xb6c0ee, 0xb6c0ee }, { 0x9cc84a, 0xc4df7c, 0xc4df7c },
+  { 0xe48f3c, 0xf0b868, 0xf0b868 }, { 0x3b50bd, 0x5a4cb4, 0x5a4cb4 },
+  { 0xe6d2c2, 0xf2e8de, 0xe6d2c2 } };
 
 struct Blob { int m; float c[3]; float ax, ay, r, s, ph, a0, a1; };
 
@@ -28,7 +29,7 @@ struct Field {
     ex += (tu - ex) * (1.0f - std::exp(-dt / 0.24f));
     ey += (tv - ey) * (1.0f - std::exp(-dt / 0.24f));
     surge *= std::exp(-dt / 1.1f); flash *= std::exp(-dt / 0.32f);
-    const float hum = 0.6f + human * 0.8f, tz = 0.85f + taste * 0.3f, sp = 1.0f + surge * 2.2f, sat = 0.7f + taste * 0.6f;
+    const float hum = 0.6f + human * 0.8f, tz = 0.85f + taste * 0.3f, sp = 1.0f + surge * 2.2f, sat = 0.55f + taste * 0.5f;
     const float wt[4] = { (1 - ex) * (1 - ey), ex * (1 - ey), (1 - ex) * ey, ex * ey };
     const float wc = std::max(0.0f, 1.0f - std::hypot(ex - 0.5f, ey - 0.5f) * 2.2f);
     const int n = (int) B.size();
@@ -66,7 +67,7 @@ struct Field {
           const float wr = R * inv * sh, wg = G * inv * sh, wb = Bc * inv * sh;
           r += (wr - r) * wx + wr * (rim + gl); g += (wg - g) * wx + wg * (rim + gl); b += (wb - b) * wx + wb * (rim + gl);
         }
-        const float gray = 0.299f * r + 0.587f * g + 0.114f * b;
+        const float gray = 0.213f * r + 0.715f * g + 0.072f * b;
         r = gray + (r - gray) * sat; g = gray + (g - gray) * sat; b = gray + (b - gray) * sat;
         const int o = (y * W + x) * 3;
         out[o] = (uint8_t) std::min(255.0f, std::max(0.0f, r));
@@ -88,11 +89,10 @@ private:
       add(i, PAL[i][0], a ? .86f : .14f, b ? .8f : .2f, .27f, .35f, fi * 1.7f);
       add(i, PAL[i][1], a ? .68f : .32f, b ? .6f : .4f, .17f, .5f, fi * 2.3f + 1.0f);
       add(i, PAL[i][2], a ? .95f : .05f, b ? .42f : .58f, .1f, .7f, fi * .9f + 2.0f);
-      add(i, PAL[i][1], a ? .78f : .22f, b ? .92f : .08f, .09f, .6f, fi * 1.3f + 4.0f);
     }
     add(-1, PAL[4][0], .5f, .5f, .16f, .45f, 0.0f); add(-1, PAL[4][1], .42f, .6f, .12f, .55f, 2.1f); add(-1, PAL[4][2], .58f, .42f, .1f, .65f, 4.2f);
-    static const float BG[4][3] = { { 22, 28, 60 }, { 20, 38, 16 }, { 46, 22, 10 }, { 10, 14, 46 } };
-    static const float LIFT[3] = { 34, 22, 24 };
+    static const float BG[4][3] = { { 22, 28, 58 }, { 20, 34, 16 }, { 44, 22, 10 }, { 10, 14, 44 } };
+    static const float LIFT[3] = { 30, 20, 22 };
     bg.resize((size_t) (W * H * 3));
     for (int y = 0; y < H; ++y)
       for (int x = 0; x < W; ++x) {
