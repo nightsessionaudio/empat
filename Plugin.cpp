@@ -3,6 +3,7 @@
 #include <array>
 #include "ChordGen.h"
 #include "LogoData.h"
+#include "LavaPad.h"
 
 class NSAProcessor : public juce::AudioProcessor {
 public:
@@ -610,41 +611,46 @@ struct HeartBtn : juce::Component, private juce::Timer {
   bool on = false, hover = false; int pulse = 0, count = 0;
 };
 
-// ПЭД: северное сияние в углах (цвет настроения), мерцающие звёзды, редкая падающая звезда
+// ПЭД: лава-лампа под глянцевым стеклом (Aqua, 2000-е). Цвет капель = настроение угла, центр = баланс.
+// Nostalgia → зерно/тёплая виньетка, Air → пузырьки и свечение, Human → размах дрейфа, Taste → размер и насыщенность.
 struct PadBox : juce::Component, private juce::Timer {
   explicit PadBox(NSAProcessor& p) : proc(p) {
     setMouseCursor(juce::MouseCursor::CrosshairCursor);
-    t0 = juce::Time::getMillisecondCounterHiRes();
-    sprite = juce::Image(juce::Image::ARGB, 32, 32, true);
+    t0 = juce::Time::getMillisecondCounterHiRes(); lastT = 0.0f;
+    lavaImg = juce::Image(juce::Image::ARGB, lava::W, lava::H, true);
+    grain = juce::Image(juce::Image::ARGB, 128, 128, true);
     {
-      juce::Graphics sg(sprite);
-      juce::ColourGradient gr(juce::Colour(0xfffff8e6), 16.0f, 16.0f, juce::Colour(0x00fff8e6), 32.0f, 16.0f, true);
-      gr.addColour(0.25, juce::Colour(0xfffff8e6).withAlpha(0.45f));
-      sg.setGradientFill(gr); sg.fillAll();
+      juce::Random gr(11);
+      juce::Image::BitmapData bd(grain, juce::Image::BitmapData::writeOnly);
+      for (int y = 0; y < 128; ++y)
+        for (int x = 0; x < 128; ++x) {
+          const juce::uint8 v = gr.nextBool() ? (juce::uint8) 255 : (juce::uint8) 0;
+          juce::PixelARGB px((juce::uint8) (gr.nextFloat() * 70.0f), v, v, v); px.premultiply();
+          *reinterpret_cast<juce::PixelARGB*>(bd.getPointer(x, y)) = px;
+        }
     }
-    nextShoot = 2.5f;
+    for (int i = 0; i < 16; ++i) bub[i] = { (float) ((i * 41) % 96) / 100.0f, 3.0f + (float) ((i * 7) % 8), 7.0f + (float) (i % 6), (float) i * 1.1f };
+    sx = proc.dark.load(); sy = proc.tense.load();
     startTimerHz(30);
   }
   float now() const { return (float) ((juce::Time::getMillisecondCounterHiRes() - t0) * 0.001); }
-  void flash() { flashAt = now(); }
+  void flash() { field.pulse(); ripples.push_back(now()); }   // Generate
+  void surge() { field.kick(); }                              // Evolve
   juce::Rectangle<float> area() const { return getLocalBounds().toFloat().reduced(14.0f); }
+  juce::Point<float> dotPos() const { const auto a = area(); return { a.getX() + sx * a.getWidth(), a.getBottom() - sy * a.getHeight() }; }
 
-  void resized() override {
-    stars.clear();
-    const float W = (float) getWidth(), H = (float) getHeight(); if (W <= 0.0f || H <= 0.0f) return;
-    juce::Random rg(7); const int n = (int) (W * H / 850.0f);
-    for (int i = 0; i < n; ++i) {
-      Star s; s.x = rg.nextFloat() * W; s.y = rg.nextFloat() * H;
-      s.b = 0.3f + std::pow(rg.nextFloat(), 1.6f) * 0.7f; s.r = 0.7f + rg.nextFloat() * 1.3f;
-      s.p = rg.nextFloat() * 6.0f; s.s = 0.35f + rg.nextFloat() * 1.1f;
-      stars.push_back(s);
-    }
-  }
   void timerCallback() override {
-    const float tt = now(), W = (float) getWidth(), H = (float) getHeight();
-    if (!shoot && tt > nextShoot && W > 0.0f) {
-      shoot = true; shT0 = tt; shX = W * (0.4f + 0.55f * rnd.nextFloat()); shY = H * rnd.nextFloat() * 0.3f;
-      shVX = -W * 0.62f; shVY = H * 0.5f; nextShoot = tt + 9.0f + rnd.nextFloat() * 9.0f;
+    const float tt = now(), dt = juce::jlimit(0.001f, 0.1f, tt - lastT); lastT = tt;
+    const float k = 1.0f - std::exp(-dt / 0.05f);
+    sx += (proc.dark.load() - sx) * k; sy += (proc.tense.load() - sy) * k;
+    if (getWidth() > 0 && getHeight() > 0) {
+      const auto d = dotPos();
+      field.render(rgb, dt, d.x / (float) getWidth(), d.y / (float) getHeight(), proc.human.load(), proc.tasteAmt.load());
+      juce::Image::BitmapData bd(lavaImg, juce::Image::BitmapData::writeOnly);
+      for (int y = 0; y < lava::H; ++y) {
+        auto* row = reinterpret_cast<juce::PixelARGB*>(bd.getLinePointer(y));
+        for (int x = 0; x < lava::W; ++x) { const int o = (y * lava::W + x) * 3; row[x].setARGB(255, rgb[o], rgb[o + 1], rgb[o + 2]); }
+      }
     }
     repaint();
   }
@@ -652,90 +658,122 @@ struct PadBox : juce::Component, private juce::Timer {
   void paint(juce::Graphics& g) override {
     const auto bounds = getLocalBounds().toFloat();
     const float W = bounds.getWidth(), H = bounds.getHeight(), tt = now();
-    juce::Path clip; clip.addRoundedRectangle(bounds, 14.0f);
+    const float rad = 16.0f;
+    juce::Path clip; clip.addRoundedRectangle(bounds, rad);
     g.reduceClipRegion(clip, juce::AffineTransform());
     g.setColour(juce::Colour(0xff0e0d10)); g.fillRect(bounds);
 
-    // сияние: у каждого угла своё настроение — Ethereal / Toxic / Candlelight / 4 AM
-    static const int CC[4][3] = { {110,170,215}, {90,170,130}, {205,125,85}, {75,95,215} };
-    static const float QX[4] = {0.0f, 1.0f, 0.0f, 1.0f}, QY[4] = {0.0f, 0.0f, 1.0f, 1.0f};
-    for (int qi = 0; qi < 4; ++qi) {
-      const juce::Colour c = juce::Colour::fromRGB((juce::uint8) CC[qi][0], (juce::uint8) CC[qi][1], (juce::uint8) CC[qi][2]);
-      const float bx = QX[qi] * W, by = QY[qi] * H;
-      const float th0 = std::atan2((0.5f - QY[qi]) * H, (0.5f - QX[qi]) * W), L = std::hypot(W, H) * 0.2f;
-      const float br = 0.78f + 0.22f * std::sin(tt * 0.3f + (float) qi * 1.9f), R0 = W * 0.34f;
-      juce::ColourGradient gr(c.withAlpha(0.20f * br), bx, by, c.withAlpha(0.0f), bx + R0, by, true);
-      g.setGradientFill(gr); g.fillEllipse(bx - R0, by - R0, 2.0f * R0, 2.0f * R0);
-      for (int k = 0; k < 3; ++k) {
-        const float ph = tt * (0.1f + 0.04f * (float) k) + (float) qi * 1.7f + (float) k * 2.1f;
-        const float an = th0 + (float) (k - 1) * 0.6f + std::sin(ph) * 0.22f;
-        const float d = L * (0.7f + 0.45f * std::sin(ph * 1.3f + (float) k));
-        const float cx = bx + std::cos(an) * d, cy = by + std::sin(an) * d, R = W * (0.3f + 0.05f * (float) k);
-        const float a = 0.15f + 0.06f * std::sin(ph * 1.7f + (float) k);
-        juce::Graphics::ScopedSaveState ss(g);
-        g.addTransform(juce::AffineTransform::scale(1.0f, 0.26f).rotated(an).translated(cx, cy));
-        juce::ColourGradient gg(c.withAlpha(a), 0.0f, 0.0f, c.withAlpha(0.0f), R, 0.0f, true);
-        g.setGradientFill(gg); g.fillEllipse(-R, -R, 2.0f * R, 2.0f * R);
-      }
+    // лава
+    g.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
+    g.setOpacity(1.0f); g.drawImage(lavaImg, bounds);
+
+    // Nostalgia: тёплый тон, виньетка, плёночное зерно
+    const float nost = proc.nost.load(), air = proc.air.load();
+    if (nost > 0.01f) {
+      g.setColour(juce::Colour::fromRGB(255, 150, 70).withAlpha(0.28f * nost)); g.fillRect(bounds);
+      juce::ColourGradient vg(juce::Colour(0x00140800), W * 0.5f, H * 0.5f, juce::Colour(0xff140800).withAlpha(0.6f * nost), 0.0f, 0.0f, true);
+      vg.addColour(0.45, juce::Colour(0x00140800));
+      g.setGradientFill(vg); g.fillRect(bounds);
+      g.setTiledImageFill(grain, (int) (rnd.nextFloat() * 128.0f), (int) (rnd.nextFloat() * 128.0f), 0.9f * nost);
+      g.fillRect(bounds);
+    }
+    // Air: свечение сверху + пузырьки под стеклом
+    if (air > 0.01f) {
+      juce::ColourGradient bl(juce::Colours::white.withAlpha(0.28f * air), W * 0.5f, 0.0f, juce::Colours::white.withAlpha(0.0f), W * 0.5f, H * 0.9f, true);
+      g.setGradientFill(bl); g.fillRect(bounds);
+    }
+    const float bopa = 0.3f + 0.7f * air;
+    for (int i = 0; i < 16; ++i) {
+      const auto& b = bub[i];
+      const float pr = std::fmod((tt + b.delay) / b.dur, 1.0f);
+      const float sway = pr < 0.5f ? 10.0f * pr / 0.5f : 10.0f - 16.0f * (pr - 0.5f) / 0.5f;
+      const float bx = b.x * W + sway, by = H + 12.0f - b.z - pr * H * 1.2f, r = b.z * 0.5f;
+      juce::ColourGradient bg2(juce::Colours::white.withAlpha(0.95f * bopa), bx - r * 0.4f, by - r * 0.4f, juce::Colours::white.withAlpha(0.0f), bx + r * 1.2f, by + r * 1.2f, true);
+      bg2.addColour(0.45, juce::Colours::white.withAlpha(0.14f * bopa));
+      g.setGradientFill(bg2); g.fillEllipse(bx - r, by - r, 2.0f * r, 2.0f * r);
+      g.setColour(juce::Colours::white.withAlpha(0.3f * bopa)); g.drawEllipse(bx - r, by - r, 2.0f * r, 2.0f * r, 1.0f);
     }
 
-    // звёзды: всегда светятся, у каждой свой ритм
-    const float boost = juce::jmax(0.0f, 1.0f - (tt - flashAt) / 1.2f);
-    for (const auto& s : stars) {
-      const float a = juce::jmin(1.0f, s.b * (0.72f + 0.28f * std::sin(tt * s.s + s.p)) + boost * 0.4f);
-      const float gz = s.r * (s.b > 0.6f ? 7.0f : 4.5f);
-      g.setOpacity(a * 0.55f);
-      g.drawImage(sprite, juce::Rectangle<float>(s.x - gz * 0.5f, s.y - gz * 0.5f, gz, gz));
-      g.setColour(juce::Colour(0xfffff6e2).withAlpha(a));
-      g.fillRect(s.x - s.r * 0.35f, s.y - s.r * 0.35f, s.r * 0.7f, s.r * 0.7f);
+    // точка: бусина, свечение смешивается из цветов углов
+    const float dk = sx, tn = sy;
+    const float wTL = (1.0f - dk) * tn, wTR = dk * tn, wBL = (1.0f - dk) * (1.0f - tn), wBR = dk * (1.0f - tn);
+    const float wts[4] = { wTL, wTR, wBL, wBR };
+    float mc[3] = { 0, 0, 0 };
+    for (int q = 0; q < 4; ++q) {
+      const unsigned c = lava::PAL[q][0];
+      mc[0] += wts[q] * (float) ((c >> 16) & 255); mc[1] += wts[q] * (float) ((c >> 8) & 255); mc[2] += wts[q] * (float) (c & 255);
     }
-    // редкая падающая звезда
-    if (shoot) {
-      const float ag = tt - shT0;
-      if (ag > 0.9f) shoot = false;
-      else {
-        const float hx = shX + shVX * ag, hy = shY + shVY * ag, tx = hx - shVX * 0.22f, ty = hy - shVY * 0.22f;
-        const float al = std::sin(ag / 0.9f * juce::MathConstants<float>::pi);
-        juce::ColourGradient lg(juce::Colour(0xfffff8e6).withAlpha(0.0f), tx, ty, juce::Colour(0xfffff8e6).withAlpha(al), hx, hy, false);
-        g.setGradientFill(lg); g.drawLine(tx, ty, hx, hy, 1.6f);
-        g.setOpacity(al); g.drawImage(sprite, juce::Rectangle<float>(hx - 6.0f, hy - 6.0f, 12.0f, 12.0f));
-      }
+    const juce::Colour oc = juce::Colour::fromRGB((juce::uint8) juce::jlimit(0, 255, (int) mc[0]), (juce::uint8) juce::jlimit(0, 255, (int) mc[1]), (juce::uint8) juce::jlimit(0, 255, (int) mc[2]));
+    const auto dp = dotPos(); const float ox = dp.x, oy = dp.y;
+    const float breathe = 1.0f + 0.1f * 0.5f * (std::sin(tt * juce::MathConstants<float>::twoPi / 3.2f) + 1.0f);
+    const float sc = (down ? 1.2f : breathe);
+    juce::ColourGradient gl(oc.withAlpha(0.85f), ox, oy, oc.withAlpha(0.0f), ox + 38.0f * sc, oy, true);
+    gl.addColour(0.35, oc.withAlpha(0.35f));
+    g.setGradientFill(gl); g.fillEllipse(ox - 38.0f * sc, oy - 38.0f * sc, 76.0f * sc, 76.0f * sc);
+    g.setColour(juce::Colours::white.withAlpha(0.16f)); g.fillEllipse(ox - 18.0f * sc, oy - 18.0f * sc, 36.0f * sc, 36.0f * sc);
+    juce::ColourGradient cg(juce::Colours::white, ox - 4.0f * sc, oy - 5.0f * sc, juce::Colour(0xffa9b8d8), ox + 13.0f * sc, oy + 13.0f * sc, true);
+    cg.addColour(0.45, juce::Colour(0xffeef4ff));
+    g.setGradientFill(cg); g.fillEllipse(ox - 12.0f * sc, oy - 12.0f * sc, 24.0f * sc, 24.0f * sc);
+
+    // Generate: сонарное кольцо
+    for (size_t i = 0; i < ripples.size();) {
+      const float p = (tt - ripples[i]) / 1.1f;
+      if (p >= 1.0f) { ripples.erase(ripples.begin() + (long) i); continue; }
+      const float rr = 15.0f * (1.0f + 8.0f * p);
+      g.setColour(juce::Colours::white.withAlpha(0.8f * (1.0f - p))); g.drawEllipse(ox - rr, oy - rr, 2.0f * rr, 2.0f * rr, 2.0f);
+      ++i;
     }
 
-    const float dk = proc.dark.load(), tn = proc.tense.load();
+    // ---- стекло (Aqua gloss) ----
+    // фаска: тёмные края внутри + мягкий отсвет снизу
+    auto edge = [&](float x1, float y1, float x2, float y2, juce::Rectangle<float> r, float a) {
+      juce::ColourGradient eg(juce::Colours::black.withAlpha(a), x1, y1, juce::Colours::black.withAlpha(0.0f), x2, y2, false);
+      g.setGradientFill(eg); g.fillRect(r);
+    };
+    edge(0.0f, 0.0f, 22.0f, 0.0f, { 0.0f, 0.0f, 22.0f, H }, 0.6f);
+    edge(W, 0.0f, W - 22.0f, 0.0f, { W - 22.0f, 0.0f, 22.0f, H }, 0.6f);
+    edge(0.0f, 0.0f, 0.0f, 22.0f, { 0.0f, 0.0f, W, 22.0f }, 0.55f);
+    edge(0.0f, H, 0.0f, H - 22.0f, { 0.0f, H - 22.0f, W, 22.0f }, 0.5f);
+    {
+      juce::ColourGradient bg3(juce::Colours::white.withAlpha(0.07f), 0.0f, H, juce::Colours::white.withAlpha(0.0f), 0.0f, H - 24.0f, false);
+      g.setGradientFill(bg3); g.fillRect(0.0f, H - 24.0f, W, 24.0f);
+    }
+    // нижний отсвет (эллипс)
+    {
+      juce::Graphics::ScopedSaveState ss(g);
+      const float rx = W * 0.4f;
+      g.addTransform(juce::AffineTransform::scale(1.0f, (H * 0.34f) / rx).translated(W * 0.5f, H));
+      juce::ColourGradient eg(juce::Colours::white.withAlpha(0.24f), 0.0f, 0.0f, juce::Colours::white.withAlpha(0.0f), rx, 0.0f, true);
+      g.setGradientFill(eg); g.fillEllipse(-rx, -rx, 2.0f * rx, 2.0f * rx);
+    }
+    // верхний глянцевый блик (дышит)
+    {
+      const float x = W * 0.03f, w = W * 0.94f, y = H * 0.02f, h = H * 0.46f, rt = 14.0f;
+      juce::Path gp;
+      gp.startNewSubPath(x, y + rt); gp.quadraticTo(x, y, x + rt, y);
+      gp.lineTo(x + w - rt, y); gp.quadraticTo(x + w, y, x + w, y + rt);
+      gp.lineTo(x + w, y + h * 0.55f); gp.quadraticTo(x + w * 0.5f, y + h * 1.25f, x, y + h * 0.55f);
+      gp.closeSubPath();
+      const float br = 0.825f + 0.175f * std::sin(tt * juce::MathConstants<float>::twoPi / 12.0f);
+      juce::ColourGradient hg(juce::Colours::white.withAlpha(0.36f * br), 0.0f, y, juce::Colours::white.withAlpha(0.03f * br), 0.0f, y + h * 1.05f, false);
+      g.setGradientFill(hg); g.fillPath(gp);
+      g.setColour(juce::Colours::white.withAlpha(0.7f)); g.fillEllipse(W * 0.045f, H * 0.05f, W * 0.09f, H * 0.06f);
+    }
+    g.setColour(juce::Colours::black.withAlpha(0.85f)); g.drawRoundedRectangle(bounds.reduced(0.5f), rad, 1.0f);
+    g.setColour(juce::Colours::white.withAlpha(0.28f)); g.drawRoundedRectangle(bounds.reduced(1.5f), rad - 1.0f, 1.0f);
+
     // подписи углов: ярче у того, к которому ближе точка
-    g.setFont(11.0f);
-    auto lab = [&](const char* s, float cxn, float cyn, juce::Rectangle<int> rc, juce::Justification j) {
-      const float d = std::hypot(dk - cxn, tn - cyn);
-      g.setColour(ui::tag.withAlpha(0.3f + 0.7f * juce::jmax(0.0f, 1.0f - d / 1.2f)));
-      g.drawText(s, rc, j);
+    g.setFont(juce::Font(juce::FontOptions(12.0f)));
+    auto lab = [&](const char* s, float w, juce::Rectangle<int> rc, juce::Justification j) {
+      const float al = 0.55f + 0.45f * juce::jmin(1.0f, w * 2.2f);
+      g.setColour(juce::Colours::black.withAlpha(0.6f * al)); g.drawText(s, rc.translated(0, 1), j);
+      g.setColour(juce::Colours::white.withAlpha(al)); g.drawText(s, rc, j);
     };
     const int w = getWidth(), h = getHeight();
-    lab("Ethereal", 0.0f, 1.0f, { 12, 8, 110, 16 }, juce::Justification::left);
-    lab("Toxic", 1.0f, 1.0f, { w - 122, 8, 110, 16 }, juce::Justification::right);
-    lab("Candlelight", 0.0f, 0.0f, { 12, h - 24, 110, 16 }, juce::Justification::left);
-    lab("4 AM", 1.0f, 0.0f, { w - 122, h - 24, 110, 16 }, juce::Justification::right);
-
-    // точка: дышит, цвет смешивается из цветов углов
-    const auto a = area();
-    const float ox = a.getX() + dk * a.getWidth(), oy = a.getBottom() - tn * a.getHeight();
-    const float wTL = (1.0f - dk) * tn, wTR = dk * tn, wBL = (1.0f - dk) * (1.0f - tn), wBR = dk * (1.0f - tn);
-    int mc[3];
-    for (int i = 0; i < 3; ++i)
-      mc[i] = juce::jmin(255, (int) std::lround(wTL * (float) CC[0][i] + wTR * (float) CC[1][i] + wBL * (float) CC[2][i] + wBR * (float) CC[3][i]) + 40);
-    const juce::Colour oc = juce::Colour::fromRGB((juce::uint8) mc[0], (juce::uint8) mc[1], (juce::uint8) mc[2]);
-    const float breathe = 1.0f + 0.06f * (std::sin(tt * juce::MathConstants<float>::twoPi / 3.4f) + 1.0f);
-    const float fe = juce::jmax(0.0f, 1.0f - (tt - flashAt) / 0.8f);
-    const float sc = (down ? 1.25f : breathe) * (1.0f + 0.2f * fe);
-    juce::ColourGradient gl(oc.withAlpha(0.60f), ox, oy, oc.withAlpha(0.0f), ox + 40.0f * sc, oy, true);
-    gl.addColour(0.35, oc.withAlpha(0.28f));
-    g.setGradientFill(gl); g.fillEllipse(ox - 40.0f * sc, oy - 40.0f * sc, 80.0f * sc, 80.0f * sc);
-    g.setColour(oc.withAlpha(0.20f)); g.fillEllipse(ox - 20.0f * sc, oy - 20.0f * sc, 40.0f * sc, 40.0f * sc);
-    juce::ColourGradient cg(juce::Colours::white, ox - 4.0f * sc, oy - 5.0f * sc, juce::Colour(0xffe8e3d8), ox + 13.0f * sc, oy + 13.0f * sc, true);
-    g.setGradientFill(cg); g.fillEllipse(ox - 13.0f * sc, oy - 13.0f * sc, 26.0f * sc, 26.0f * sc);
-    g.setColour(ui::accentHi); g.drawEllipse(ox - 12.0f * sc, oy - 12.0f * sc, 24.0f * sc, 24.0f * sc, 2.0f);
-
-    g.setColour(juce::Colours::white.withAlpha(0.08f)); g.drawRoundedRectangle(bounds.reduced(0.5f), 14.0f, 1.0f);
+    lab("Ethereal", wTL, { 14, 8, 110, 16 }, juce::Justification::left);
+    lab("Toxic", wTR, { w - 124, 8, 110, 16 }, juce::Justification::right);
+    lab("Candlelight", wBL, { 14, h - 24, 110, 16 }, juce::Justification::left);
+    lab("4 AM", wBR, { w - 124, h - 24, 110, 16 }, juce::Justification::right);
   }
   void mouseDown(const juce::MouseEvent& e) override { down = true; move(e); }
   void mouseDrag(const juce::MouseEvent& e) override { move(e); }
@@ -746,10 +784,11 @@ struct PadBox : juce::Component, private juce::Timer {
     proc.tense = juce::jlimit(0.0f, 1.0f, (a.getBottom() - e.position.y) / a.getHeight());
     proc.padChanged();
   }
-  struct Star { float x = 0, y = 0, b = 0.5f, r = 1.0f, p = 0, s = 1.0f; };
-  NSAProcessor& proc; std::vector<Star> stars; juce::Image sprite; juce::Random rnd;
-  double t0 = 0; float nextShoot = 2.5f, flashAt = -10.0f, shT0 = 0, shX = 0, shY = 0, shVX = 0, shVY = 0;
-  bool shoot = false, down = false;
+  struct Bub { float x, z, dur, delay; };
+  NSAProcessor& proc; lava::Field field; juce::Image lavaImg, grain; juce::Random rnd;
+  uint8_t rgb[lava::W * lava::H * 3] = {};
+  Bub bub[16]; std::vector<float> ripples;
+  double t0 = 0; float lastT = 0.0f, sx = 0.5f, sy = 0.5f; bool down = false;
 };
 
 class NSAEditor : public juce::AudioProcessorEditor, private juce::Timer {
@@ -778,7 +817,7 @@ public:
     genBtn.text = "Generate"; genBtn.primary = true;
     genBtn.onClick = [this] { proc.generate(); pad.flash(); };
     contBtn.text = "Evolve";
-    contBtn.onClick = [this] { proc.evolve(); pad.flash(); };
+    contBtn.onClick = [this] { proc.evolve(); pad.surge(); };
 
     nobassBtn.setButtonText("No bass");
     nobassBtn.setToggleState(proc.noBass.load(), juce::dontSendNotification);
