@@ -2,7 +2,6 @@
 #include <climits>
 #include <array>
 #include "ChordGen.h"
-#include "LogoData.h"
 #include "LavaPad.h"
 
 class NSAProcessor : public juce::AudioProcessor {
@@ -164,6 +163,7 @@ public:
     if (newSeed) seed = uiRng.nextInt();
     juce::Random r(seed);
     juce::SpinLock::ScopedLockType l(lock);
+    if (newSeed) { undoState = state; hasUndo = true; canUndo = true; } // шаг назад — только для явного Generate, не для правок пэда
     state.feel = currentFeel();
     state.generate(r, key, dark, tense, open != 0, getCurrentBpm(), newSeed, &taste, tasteAmt.load()); ++version;
     liked = false; // новая прогрессия — сердечко снова серое
@@ -191,9 +191,17 @@ public:
   }
   void evolve() {
     juce::SpinLock::ScopedLockType l(lock);
+    undoState = state; hasUndo = true; canUndo = true;
     state.feel = currentFeel();
     state.evolve(uiRng, key, tense, open != 0, getCurrentBpm(), &taste, tasteAmt.load()); ++version;
     liked = false;
+  }
+  // шаг назад: вернуть прогрессию, которая была до последнего Generate/Evolve
+  void undo() {
+    juce::SpinLock::ScopedLockType l(lock);
+    if (!hasUndo) return;
+    state = undoState; hasUndo = false; canUndo = false; ++version;
+    liked = false; // упрощение: лайк прошлой прогрессии не восстанавливаем
   }
   void setKey(int nk) {
     lastKey = key; key = nk;
@@ -342,15 +350,17 @@ public:
   std::atomic<float> nost{0.0f}, air{0.0f}, tear{0.0f}, human{0.5f};
   std::atomic<int> res{RES_HOME}, scene{0};
   std::atomic<bool> liked{false};
-  std::atomic<float> tasteAmt{0.7f};
+  std::atomic<float> tasteAmt{0.5f};
   std::atomic<int> tasteCount{0};
+  std::atomic<bool> canUndo{false};
 
 private:
   struct Act { int note; double end; };
   struct Pend { double t; int note; juce::uint8 vel; };
   std::vector<Pend> pending;
   juce::SpinLock lock;
-  ChordGen state, snap;
+  ChordGen state, snap, undoState;
+  bool hasUndo = false;
   Taste taste; // под lock
   std::atomic<int> version{0};
   int snapVersion = -1, seed = 1, lastKey = 0;
@@ -404,6 +414,32 @@ namespace ui {
     g.setGradientFill(gr); g.fillRoundedRectangle(r, rad);
     g.setColour(mint.withAlpha(0.07f * k)); g.fillRoundedRectangle(r.reduced(1.0f), rad);
     g.setColour(mint.withAlpha(juce::jmin(1.0f, 0.6f * k))); g.drawRoundedRectangle(r.reduced(0.5f), rad, 1.0f);
+  }
+  // круговая стрелка со стрелкой-наконечником: fromDeg..toDeg — дуга по часовой; direction стрелки берётся из знака (toDeg-fromDeg)
+  inline void arcArrow(juce::Graphics& g, juce::Rectangle<float> b, juce::Colour c, float fromDeg, float toDeg) {
+    const float s = juce::jmin(b.getWidth(), b.getHeight()) * 0.72f;
+    const float cx = b.getCentreX(), cy = b.getCentreY(), rad = s * 0.5f;
+    const float a0 = juce::degreesToRadians(fromDeg), a1 = juce::degreesToRadians(toDeg);
+    juce::Path p; p.addArc(cx - rad, cy - rad, s, s, a0, a1, true);
+    g.setColour(c); g.strokePath(p, juce::PathStrokeType(s * 0.13f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    const float dir = (a1 >= a0) ? 1.0f : -1.0f;
+    const float px = cx + rad * std::cos(a1), py = cy + rad * std::sin(a1);
+    const float tx = -std::sin(a1) * dir, ty = std::cos(a1) * dir, nx = std::cos(a1), ny = std::sin(a1);
+    const float h = s * 0.28f, w = s * 0.17f;
+    juce::Path head;
+    head.addTriangle(px + tx * h, py + ty * h, px + nx * w, py + ny * w, px - nx * w, py - ny * w);
+    g.fillPath(head);
+  }
+  inline void iconRefresh(juce::Graphics& g, juce::Rectangle<float> b, juce::Colour c) { arcArrow(g, b, c, -55.0f, 230.0f); }
+  inline void iconUndo(juce::Graphics& g, juce::Rectangle<float> b, juce::Colour c) { arcArrow(g, b, c, 200.0f, -30.0f); }
+  inline void iconDice(juce::Graphics& g, juce::Rectangle<float> b, juce::Colour c) {
+    const float s = juce::jmin(b.getWidth(), b.getHeight()) * 0.74f;
+    const auto box = juce::Rectangle<float>(s, s).withCentre(b.getCentre());
+    g.setColour(c.withAlpha(0.85f)); g.drawRoundedRectangle(box.reduced(1.0f), s * 0.22f, 1.6f);
+    const float rr = s * 0.08f;
+    auto dot = [&](float u, float v) { const auto p = box.getRelativePoint(u, v); g.fillEllipse(p.x - rr, p.y - rr, rr * 2.0f, rr * 2.0f); };
+    g.setColour(c);
+    dot(0.26f, 0.26f); dot(0.74f, 0.26f); dot(0.5f, 0.5f); dot(0.26f, 0.74f); dot(0.74f, 0.74f);
   }
   inline void glowText(juce::Graphics& g, const juce::String& s, juce::Rectangle<int> r, juce::Justification j, juce::Colour c, float ga) {
     if (ga > 0.01f) {
@@ -510,10 +546,12 @@ struct KeySlider : juce::Component, private juce::Timer {
       g.setColour(ui::mu.withAlpha(0.7f * a)); g.fillEllipse(x - 2.0f, r.getCentreY() - 2.0f, 4.0f, 4.0f);
     }
     const float tx = in.getX() + in.getWidth() * cur / 12.0f, sc = 1.0f + 0.07f * grow;
-    const auto t = juce::Rectangle<float>(64.0f * sc, (r.getHeight() - 10.0f) * sc).withCentre({ tx, r.getCentreY() });
-    ui::pill(g, t, 10.0f);
+    const auto pillR = juce::Rectangle<float>(64.0f * sc, (r.getHeight() - 10.0f) * sc).withCentre({ tx, r.getCentreY() });
+    ui::pill(g, pillR, 10.0f);
+    // текст рисуется в рамке ФИКСИРОВАННОГО размера (не зависит от sc), чтобы буква не "съезжала" при анимации капсулы
+    const auto textR = juce::Rectangle<float>(64.0f, r.getHeight() - 10.0f).withCentre({ tx, r.getCentreY() });
     g.setFont(ui::font(13.0f, 0.08f, false));
-    ui::glowText(g, nameOf(juce::jlimit(0, 12, (int) std::lround(cur))), t.toNearestInt(), juce::Justification::centred, ui::mintHi, 0.7f);
+    ui::glowText(g, nameOf(juce::jlimit(0, 12, (int) std::lround(cur))), textR.toNearestInt(), juce::Justification::centred, ui::mintHi, 0.7f);
   }
   float fromX(float x) const { const auto in = inner(); return juce::jlimit(0.0f, 12.0f, (x - in.getX()) / in.getWidth() * 12.0f); }
   void mouseDown(const juce::MouseEvent& e) override { drag = true; tar = fromX(e.position.x); last = ui::nowSec(); startTimerHz(60); }
@@ -560,21 +598,20 @@ struct LedToggle : juce::Component, private juce::Timer {
     auto r = getLocalBounds().toFloat().reduced(0.5f);
     if (down) r = r.withSizeKeepingCentre(r.getWidth() * 0.985f, r.getHeight() * 0.94f).translated(0.0f, 1.0f);
     ui::glass(g, r, 10.0f);
-    if (lit > 0.01f) { g.setColour(ui::amber.withAlpha(0.10f * lit)); g.fillRoundedRectangle(r.reduced(1.0f), 9.0f); }
+    // свечение теперь только у самой лампочки, а не заливает всю плитку; мягче и теплее (ретро-оранжевый)
     const float cx = r.getX() + 19.0f, cy = r.getCentreY();
     juce::ColourGradient off(juce::Colour(0xff4a3626), cx - 1.5f, cy - 2.0f, juce::Colour(0xff241810), cx + 5.0f, cy + 5.0f, true);
     g.setGradientFill(off); g.fillEllipse(cx - 5.0f, cy - 5.0f, 10.0f, 10.0f);
     g.setColour(juce::Colours::black.withAlpha(0.55f)); g.drawEllipse(cx - 5.0f, cy - 5.0f, 10.0f, 10.0f, 1.0f);
     if (lit > 0.01f) {
-      const float a = lit * flicker();
-      for (int i = 0; i < 4; ++i) {
-        const float e = 3.0f + 3.0f * (float) i;
-        g.setColour(ui::amber.withAlpha(0.20f * a * (1.0f - (float) i / 4.0f)));
+      const float a = lit * flicker() * 0.75f;
+      for (int i = 0; i < 3; ++i) {
+        const float e = 2.0f + 2.2f * (float) i;
+        g.setColour(ui::amber.withAlpha(0.11f * a * (1.0f - (float) i / 3.0f)));
         g.fillEllipse(cx - 5.0f - e, cy - 5.0f - e, 10.0f + 2.0f * e, 10.0f + 2.0f * e);
       }
-      g.setColour(ui::amber.withAlpha(0.18f * a)); g.drawEllipse(cx - 6.5f, cy - 6.5f, 13.0f, 13.0f, 3.0f);
-      juce::ColourGradient on1(juce::Colour(0xffffeccd).withAlpha(a), cx - 1.5f, cy - 2.0f, juce::Colour(0xffd9741c).withAlpha(a), cx + 5.5f, cy + 5.5f, true);
-      on1.addColour(0.55, ui::amber.withAlpha(a));
+      juce::ColourGradient on1(juce::Colour(0xffffd9a8).withAlpha(a), cx - 1.5f, cy - 2.0f, juce::Colour(0xffb5571a).withAlpha(a), cx + 5.5f, cy + 5.5f, true);
+      on1.addColour(0.55, juce::Colour(0xffe8863a).withAlpha(a));
       g.setGradientFill(on1); g.fillEllipse(cx - 5.0f, cy - 5.0f, 10.0f, 10.0f);
     }
     g.setFont(ui::font(12.0f, 0.06f));
@@ -603,22 +640,26 @@ struct LedToggle : juce::Component, private juce::Timer {
 
 // Generate (мятная, с «дыханием» и бликом по клику) и Evolve (стекло). margin — запас под свечение за пределами плитки
 struct GlassBtn : juce::Component, private juce::Timer {
+  enum class Icon { None, Dice, Refresh, Undo };
   GlassBtn() { setMouseCursor(juce::MouseCursor::PointingHandCursor); }
   void makePrimary() { primary = true; last = ui::nowSec(); startTimerHz(60); }
   void startShine() { shine = 0.0f; last = ui::nowSec(); if (!isTimerRunning()) startTimerHz(60); }
+  void setEnabled(bool v) { if (enabled != v) { enabled = v; if (!v) { hover = down = false; } repaint(); } }
   bool hitTest(int x, int y) override { return getLocalBounds().reduced(margin).contains(x, y); }
   void paint(juce::Graphics& g) override {
+    juce::Graphics::ScopedSaveState ss(g);
+    if (!enabled) g.setOpacity(0.38f);
     auto r = getLocalBounds().reduced(margin).toFloat().reduced(0.5f);
     if (down) r = r.withSizeKeepingCentre(r.getWidth() * 0.985f, r.getHeight() * 0.985f).translated(0.0f, 1.0f);
     const float rad = 12.0f;
     const float br = 0.5f + 0.5f * std::sin((float) std::fmod(ui::nowSec(), 4.5) / 4.5f * juce::MathConstants<float>::twoPi);
-    if (primary) {
+    if (primary && enabled) {
       const float spread = down ? 20.0f : 14.0f + 6.0f * br, ga = down ? 0.9f : 0.45f + 0.25f * br;
       ui::glow(g, r, rad, ui::mint, spread, ga);
       g.setColour(ui::mint.withAlpha(down ? 0.22f : 0.14f)); g.fillRoundedRectangle(r, rad);
       g.setColour(ui::mint.withAlpha(0.05f + 0.04f * br + (down ? 0.08f : 0.0f))); g.fillRoundedRectangle(r.reduced(1.0f), rad - 1.0f);
       if (shine >= 0.0f) {
-        juce::Graphics::ScopedSaveState ss(g);
+        juce::Graphics::ScopedSaveState ss2(g);
         juce::Path cp; cp.addRoundedRectangle(r, rad); g.reduceClipRegion(cp, juce::AffineTransform());
         const float e = 1.0f - (1.0f - shine) * (1.0f - shine);
         const float bw = r.getWidth() * 0.36f, x = r.getX() + (-0.6f + 1.9f * e) * r.getWidth(), sk = 8.0f;
@@ -630,20 +671,29 @@ struct GlassBtn : juce::Component, private juce::Timer {
       }
       g.setColour(ui::mint.withAlpha(0.6f)); g.drawRoundedRectangle(r, rad, 1.0f);
     } else {
-      if (down) ui::glow(g, r, rad, ui::mint, 14.0f, 0.5f);
+      if (down && enabled) ui::glow(g, r, rad, ui::mint, 14.0f, 0.5f);
       ui::glass(g, r, rad);
-      if (down) { g.setColour(ui::mint.withAlpha(0.20f)); g.fillRoundedRectangle(r, rad); }
-      if (hover) { g.setColour(ui::mint.withAlpha(0.4f)); g.drawRoundedRectangle(r, rad, 1.0f); }
+      if (down && enabled) { g.setColour(ui::mint.withAlpha(0.20f)); g.fillRoundedRectangle(r, rad); }
+      if (hover && enabled) { g.setColour(ui::mint.withAlpha(0.4f)); g.drawRoundedRectangle(r, rad, 1.0f); }
     }
-    g.setFont(ui::font(12.0f, 0.14f));
-    if (primary) ui::glowText(g, text.toUpperCase(), r.toNearestInt(), juce::Justification::centred, ui::mintHi, 0.8f);
-    else { g.setColour(ui::fg); g.drawText(text.toUpperCase(), r.toNearestInt(), juce::Justification::centred, false); }
+    const juce::Colour ic = primary ? ui::mintHi : (enabled ? ui::fg : ui::mu);
+    switch (icon) {
+      case Icon::Dice:    ui::iconDice(g, r, ic); break;
+      case Icon::Refresh: ui::iconRefresh(g, r, ic); break;
+      case Icon::Undo:    ui::iconUndo(g, r, ic); break;
+      default: break;
+    }
+    if (icon == Icon::None) {
+      g.setFont(ui::font(12.0f, 0.14f));
+      if (primary) ui::glowText(g, text.toUpperCase(), r.toNearestInt(), juce::Justification::centred, ui::mintHi, 0.8f);
+      else { g.setColour(ui::fg); g.drawText(text.toUpperCase(), r.toNearestInt(), juce::Justification::centred, false); }
+    }
   }
-  void mouseEnter(const juce::MouseEvent&) override { hover = true; repaint(); }
+  void mouseEnter(const juce::MouseEvent&) override { if (!enabled) return; hover = true; repaint(); }
   void mouseExit(const juce::MouseEvent&) override { hover = false; down = false; repaint(); }
-  void mouseDown(const juce::MouseEvent&) override { down = true; repaint(); }
+  void mouseDown(const juce::MouseEvent&) override { if (!enabled) return; down = true; repaint(); }
   void mouseUp(const juce::MouseEvent& e) override {
-    const bool hit = down && getLocalBounds().reduced(margin).contains(e.getPosition()); down = false; repaint();
+    const bool hit = enabled && down && getLocalBounds().reduced(margin).contains(e.getPosition()); down = false; repaint();
     if (hit) { if (primary) startShine(); if (onClick) onClick(); }
   }
   void timerCallback() override {
@@ -652,7 +702,7 @@ struct GlassBtn : juce::Component, private juce::Timer {
     if (!primary && shine < 0.0f) stopTimer();
     repaint();
   }
-  juce::String text; bool primary = false; int margin = 0; std::function<void()> onClick;
+  juce::String text; Icon icon = Icon::None; bool primary = false, enabled = true; int margin = 0; std::function<void()> onClick;
   bool hover = false, down = false; float shine = -1.0f; double last = 0.0;
 };
 
@@ -906,7 +956,6 @@ public:
     octSeg.onChange = [this](int i) { proc.octaveShift = i - 1; };
     keySlider.onChange = [this](int i) { proc.setKey(i); };
 
-    logoImg = juce::ImageFileFormat::loadFrom(logo::png, (size_t) logo::pngSize);
     initCtl(cNost, "Nostalgia", proc.nost.load(), [this](float v) { proc.nost = v; proc.padChanged(); });
     initCtl(cAir, "Air", proc.air.load(), [this](float v) { proc.air = v; proc.padChanged(); });
     initCtl(cHuman, "Human", proc.human.load(), [this](float v) { proc.human = v; });
@@ -914,20 +963,22 @@ public:
     heart.onClick = [this] { proc.toggleLike(); syncHeart(); if (proc.liked.load()) heart.pop(); };
     heart.onRight = [this] { showTasteMenu(); };
 
-    genBtn.text = "Generate"; genBtn.margin = 12; genBtn.makePrimary();
+    genBtn.icon = GlassBtn::Icon::Dice; genBtn.margin = 12; genBtn.makePrimary();
     genBtn.onClick = [this] { proc.generate(); pad.flash(); };
-    contBtn.text = "Evolve"; contBtn.margin = 12;
+    contBtn.icon = GlassBtn::Icon::Refresh; contBtn.margin = 12;
     contBtn.onClick = [this] { proc.evolve(); pad.surge(); };
+    undoBtn.icon = GlassBtn::Icon::Undo; undoBtn.margin = 12; undoBtn.setEnabled(proc.canUndo.load());
+    undoBtn.onClick = [this] { proc.undo(); pad.flash(); syncUndo(); };
 
     nobassBtn.setText("No bass"); nobassBtn.setOn(proc.noBass.load(), false);
     nobassBtn.onClick = [this] { proc.noBass = nobassBtn.getOn(); };
     strumBtn.setText("Strum"); strumBtn.setOn(proc.strum.load(), false);
     strumBtn.onClick = [this] { proc.strum = strumBtn.getOn(); };
 
-    for (juce::Component* c : std::initializer_list<juce::Component*>{&voiSeg, &resSeg, &octSeg, &nobassBtn, &strumBtn, &pad, &keySlider, &genBtn, &contBtn, &drag, &heart})
+    for (juce::Component* c : std::initializer_list<juce::Component*>{&voiSeg, &resSeg, &octSeg, &nobassBtn, &strumBtn, &pad, &keySlider, &genBtn, &contBtn, &undoBtn, &drag, &heart})
       addAndMakeVisible(c);
-    startTimerHz(10); syncHeart();
-    setSize(480, 660); // после настройки margin у кнопок, чтобы resized() увидел его
+    startTimerHz(10); syncHeart(); syncUndo();
+    setSize(480, 650); // после настройки margin у кнопок, чтобы resized() увидел его
   }
   ~NSAEditor() override { setLookAndFeel(nullptr); }
 
@@ -940,14 +991,6 @@ public:
       juce::ColourGradient gr(ui::mint.withAlpha(0.07f), 0.0f, 0.0f, ui::mint.withAlpha(0.0f), 1.0f, 0.0f, true);
       g.setGradientFill(gr); g.fillRect(-1.5f, -1.5f, 3.0f, 3.0f);
     }
-    // шапка: логотип + NIGHT SESSION AUDIO и тонкая линия
-    const float lh = 28.0f, lw = lh * (float) logoImg.getWidth() / (float) juce::jmax(1, logoImg.getHeight());
-    if (logoImg.isValid())
-      g.drawImage(logoImg, juce::Rectangle<float>((float) hdr.getX() + 3.0f, (float) hdr.getY(), lw, lh), juce::RectanglePlacement::stretchToFit);
-    g.setColour(juce::Colour(0xffe6f3ee)); g.setFont(ui::font(11.0f, 0.42f));
-    g.drawText("NIGHT SESSION AUDIO", juce::Rectangle<int>(hdr.getX() + 3 + (int) lw + 12, hdr.getY(), 300, hdr.getHeight()), juce::Justification::centredLeft, false);
-    g.setColour(juce::Colours::white.withAlpha(0.07f)); g.fillRect((float) hdr.getX(), (float) sepY, (float) hdr.getWidth(), 1.0f);
-
     // подписи секций
     g.setColour(ui::mu); g.setFont(ui::font(10.5f, 0.26f));
     g.drawText("VOICING", capVoi, juce::Justification::centredLeft, false);
@@ -965,7 +1008,7 @@ public:
   }
   void resized() override {
     auto r = getLocalBounds().reduced(18, 16);
-    hdr = r.removeFromTop(28); r.removeFromTop(7); sepY = r.getY(); r.removeFromTop(16);
+    r.removeFromTop(10);
 
     // три колонки 2 : 3 : 3 с зазором 10
     auto split3 = [](juce::Rectangle<int> row) {
@@ -981,29 +1024,36 @@ public:
     auto sg = split3(r.removeFromTop(32));
     voiSeg.setBounds(sg[0]); resSeg.setBounds(sg[1]); octSeg.setBounds(sg[2]);
 
-    r.removeFromTop(8); auto row = r.removeFromTop(32); const int wt = (row.getWidth() - 10) / 2;
-    nobassBtn.setBounds(row.removeFromLeft(wt)); row.removeFromLeft(10); strumBtn.setBounds(row);
+    // KEY — сразу под Voicing/Ending/Octave
+    r.removeFromTop(12); capKey = r.removeFromTop(13).withTrimmedLeft(3);
+    r.removeFromTop(4); keySlider.setBounds(r.removeFromTop(36));
 
+    // Generate (кости) / Evolve (стрелки) / Undo (назад) / Heart — одной строкой, под KEY
+    r.removeFromTop(12); auto row = r.removeFromTop(42);
+    const int qw = (row.getWidth() - 36) / 4;
+    auto q1 = row.removeFromLeft(qw); row.removeFromLeft(12);
+    auto q2 = row.removeFromLeft(qw); row.removeFromLeft(12);
+    auto q3 = row.removeFromLeft(qw); row.removeFromLeft(12);
+    auto q4 = row;
+    genBtn.setBounds(q1.expanded(genBtn.margin)); contBtn.setBounds(q2.expanded(contBtn.margin));
+    undoBtn.setBounds(q3.expanded(undoBtn.margin));
+    heart.setBounds(q4.getX(), q4.getY() - 6, q4.getWidth() + 6, q4.getHeight() + 6);
+
+    // пэд
     r.removeFromTop(12);
     const int padH = (int) std::lround((double) (r.getWidth() - 16) / 2.2);
     bezel = r.removeFromTop(8 + padH + 8);
     pad.setBounds(bezel.getX() + 8, bezel.getY() + 8, bezel.getWidth() - 16, padH);
 
-    r.removeFromTop(12); capKey = r.removeFromTop(13).withTrimmedLeft(3);
-    r.removeFromTop(4); keySlider.setBounds(r.removeFromTop(36));
-
-    r.removeFromTop(12); row = r.removeFromTop(40); const int hw = (row.getWidth() - 22) / 2;
+    // остальные параметры — под пэдом; между строками больше воздуха, чтобы свечение ручек не упиралось в соседей
+    r.removeFromTop(12); row = r.removeFromTop(46); const int hw = (row.getWidth() - 22) / 2;
     placeCtl(cNost, row.removeFromLeft(hw)); row.removeFromLeft(22); placeCtl(cAir, row);
-    r.removeFromTop(6); row = r.removeFromTop(40);
+    r.removeFromTop(16); row = r.removeFromTop(46);
     placeCtl(cHuman, row.removeFromLeft(hw)); row.removeFromLeft(22); placeCtl(cTaste, row);
 
-    r.removeFromTop(12); row = r.removeFromTop(42);
-    const int tw = (row.getWidth() - 24) / 3;
-    auto g1 = row.removeFromLeft(tw); row.removeFromLeft(12);
-    auto g2 = row.removeFromLeft(tw); row.removeFromLeft(12);
-    auto g3 = row;
-    genBtn.setBounds(g1.expanded(genBtn.margin)); contBtn.setBounds(g2.expanded(contBtn.margin));
-    heart.setBounds(g3.getX(), g3.getY() - 6, g3.getWidth() + 6, g3.getHeight() + 6);
+    // No bass / Strum — под параметрами
+    r.removeFromTop(12); row = r.removeFromTop(32); const int wt = (row.getWidth() - 10) / 2;
+    nobassBtn.setBounds(row.removeFromLeft(wt)); row.removeFromLeft(10); strumBtn.setBounds(row);
 
     r.removeFromTop(12); drag.setBounds(r.removeFromTop(36));
   }
@@ -1018,6 +1068,7 @@ public:
     c.val.setBorderSize(juce::BorderSize<int>(0, 0, 0, 3));
     c.s.setSliderStyle(juce::Slider::LinearHorizontal);
     c.s.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    c.s.setPaintingIsUnclipped(true); // иначе кольцо-ручка и его свечение обрезаются по границе слайдера
     c.s.setRange(0.0, 100.0, 1.0);
     c.s.setValue((double) v * 100.0, juce::dontSendNotification); setValText(c);
     c.s.onValueChange = [this, &c, cb] { setValText(c); cb((float) (c.s.getValue() / 100.0)); };
@@ -1039,6 +1090,7 @@ public:
     heart.setOn(proc.liked.load());
     heart.setCount(proc.tasteCount.load());
   }
+  void syncUndo() { undoBtn.setEnabled(proc.canUndo.load()); }
   void showTasteMenu() {
     const int n = proc.tasteCount.load();
     juce::PopupMenu m;
@@ -1048,16 +1100,16 @@ public:
       if (sp != nullptr && r == 1) { sp->proc.resetTaste(); sp->syncHeart(); }
     });
   }
-  void timerCallback() override { syncHeart(); }
+  void timerCallback() override { syncHeart(); syncUndo(); }
 private:
   NSALook look;
   NSAProcessor& proc;
   GlassSeg voiSeg, resSeg, octSeg; KeySlider keySlider;
   Ctl cNost, cAir, cHuman, cTaste;
-  GlassBtn genBtn, contBtn;
+  GlassBtn genBtn, contBtn, undoBtn;
   LedToggle nobassBtn, strumBtn;
-  PadBox pad; DragBox drag; HeartBtn heart; juce::Image logoImg;
-  juce::Rectangle<int> capVoi, capRes, capOct, capKey, hdr, bezel; int sepY = 0;
+  PadBox pad; DragBox drag; HeartBtn heart;
+  juce::Rectangle<int> capVoi, capRes, capOct, capKey, bezel;
 };
 
 juce::AudioProcessorEditor* NSAProcessor::createEditor() { return new NSAEditor(*this); }
