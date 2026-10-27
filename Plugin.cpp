@@ -626,7 +626,7 @@ struct PadBox : juce::Component, private juce::Timer {
         for (int x = 0; x < 128; ++x) {
           const juce::uint8 v = gr.nextBool() ? (juce::uint8) 255 : (juce::uint8) 0;
           juce::PixelARGB px((juce::uint8) (gr.nextFloat() * 70.0f), v, v, v); px.premultiply();
-          *reinterpret_cast<juce::PixelARGB*>(bd.getPointer(x, y)) = px;
+          *reinterpret_cast<juce::PixelARGB*>(bd.getPixelPointer(x, y)) = px;
         }
     }
     for (int i = 0; i < 16; ++i) bub[i] = { (float) ((i * 41) % 96) / 100.0f, 3.0f + (float) ((i * 7) % 8), 7.0f + (float) (i % 6), (float) i * 1.1f };
